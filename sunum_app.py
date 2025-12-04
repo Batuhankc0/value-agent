@@ -5,6 +5,7 @@ import shap
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 from geopy.geocoders import Nominatim
+import random
 
 # --- 1. SAYFA AYARLARI ---
 st.set_page_config(
@@ -13,37 +14,43 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- 2. MODELİ YÜKLEME (ÖNBELLEKLİ) ---
+# --- 2. MODELİ YÜKLEME ---
 @st.cache_resource
 def model_yukle():
-    # Model dosyasının proje klasöründe olduğundan emin olun
     model = xgb.XGBRegressor()
     try:
         model.load_model("ev_fiyat_modeli.json")
     except:
-        st.error("HATA: 'ev_fiyat_modeli.json' dosyası bulunamadı. Lütfen önce eğitimi tamamlayın.")
+        st.error("HATA: 'ev_fiyat_modeli.json' bulunamadı.")
         return None
     return model
 
 model = model_yukle()
 
-# --- 3. ARAYÜZ BAŞLIKLARI ---
+# --- 3. BAŞLIK ---
 st.title("🏠 Yapay Zeka Destekli Emlak Değerleme")
-st.markdown("""
-Bu uygulama, **XGBoost** makine öğrenmesi algoritmasını kullanarak İngiltere'deki evlerin 
-satış fiyatını tahmin eder ve fiyatı etkileyen faktörleri **SHAP** analizi ile açıklar.
-""")
 st.markdown("---")
 
-# --- 4. SOL PANEL (KULLANICI GİRİŞLERİ) ---
+# --- 4. SOL PANEL ---
 with st.sidebar:
-    st.header("Ev Özelliklerini Girin")
+    st.header("Ev Özellikleri")
     
-    # Adres Girişi
-    adres_girisi = st.text_input("📍 Adres veya Posta Kodu", value="173 Carmelite Road, Harrow")
-    st.caption("Örnek: HA3 5NE veya Oxford Street, London")
+    # --- ADRES VE KOORDİNAT SEÇİMİ ---
+    girdi_yontemi = st.radio("Konum Giriş Yöntemi:", ["Adres İle", "Manuel Koordinat"])
     
-    # Büyüklük Girişi (Square Feet -> m2 çevrimi)
+    lat, lon = 51.5074, -0.1278 # Varsayılan (Londra)
+    adres_metni = "Bilinmiyor"
+
+    if girdi_yontemi == "Adres İle":
+        adres_girisi = st.text_input("📍 Adres / Posta Kodu", value="HA3 5NE")
+        st.caption("Örnek: HA3 5NE veya Oxford Street")
+    else:
+        st.warning("Harita servisi çalışmazsa burayı kullanın.")
+        lat = st.number_input("Enlem (Latitude)", value=51.5074, format="%.4f")
+        lon = st.number_input("Boylam (Longitude)", value=-0.1278, format="%.4f")
+
+    st.markdown("---")
+    
     sq_ft = st.number_input("📏 Büyüklük (Square Feet)", min_value=100, value=900, step=10)
     metrekare = sq_ft / 10.764
     st.info(f"Yaklaşık: **{metrekare:.2f} m²**")
@@ -54,137 +61,98 @@ with st.sidebar:
     with col2:
         banyo = st.number_input("🛁 Banyo", min_value=1, max_value=5, value=1)
         
-    # Ev Tipi Seçimi (Sayısal kodlamaya uygun)
-    ev_tipi_secim = st.selectbox(
-        "🏠 Ev Tipi", 
-        ["Bilinmiyor/Diğer", "Daire (Flat)", "Müstakil (Detached)", "Sıralı Ev (Terraced)"]
-    )
-    # Modelin anladığı dile çevir (0, 1, 2, 3)
-    tip_map = {
-        "Bilinmiyor/Diğer": 0,
-        "Daire (Flat)": 1, 
-        "Müstakil (Detached)": 2, 
-        "Sıralı Ev (Terraced)": 3
-    }
+    ev_tipi_secim = st.selectbox("🏠 Ev Tipi", ["Bilinmiyor", "Daire", "Müstakil", "Sıralı Ev"])
+    tip_map = {"Bilinmiyor": 0, "Daire": 1, "Müstakil": 2, "Sıralı Ev": 3}
     ev_tipi = tip_map[ev_tipi_secim]
 
     hesapla_btn = st.button("💰 Fiyatı Hesapla", type="primary")
 
-# --- 5. HESAPLAMA VE SONUÇLAR ---
+# --- 5. HESAPLAMA ---
 if hesapla_btn and model:
     
-    # --- GEOCODING (ADRES -> KOORDİNAT) ---
-    geolocator = Nominatim(user_agent="sunum_app_v3")
-    location = None
+    # Eğer Adres seçildiyse koordinatları bulmaya çalış
+    if girdi_yontemi == "Adres İle":
+        # Rastgele User-Agent oluştur (Blocklanmayı azaltmak için)
+        ua = f"emlak_app_user_{random.randint(1000, 99999)}"
+        geolocator = Nominatim(user_agent=ua)
+        
+        try:
+            with st.spinner("Adres haritada aranıyor..."):
+                location = geolocator.geocode(adres_girisi, timeout=5)
+                
+                if location:
+                    lat = location.latitude
+                    lon = location.longitude
+                    adres_metni = location.address
+                    st.success("✅ Adres bulundu!")
+                else:
+                    st.error("❌ Adres bulunamadı! Lütfen 'Manuel Koordinat' seçeneğini kullanın.")
+                    st.stop()
+        except Exception as e:
+            st.error(f"⚠️ Harita servisine erişilemedi ({e}).")
+            st.warning("👉 Lütfen sol menüden **'Manuel Koordinat'** seçeneğini seçip koordinatları elle girin.")
+            st.stop()
+    else:
+        adres_metni = f"Manuel Koordinat ({lat}, {lon})"
+
+    # --- TAHMİN İŞLEMİ ---
+    input_data = pd.DataFrame({
+        'bedrooms': [oda],
+        'bathrooms': [banyo],
+        'floorAreaSqM': [metrekare],
+        'latitude': [lat],
+        'longitude': [lon],
+        'propertyType': [ev_tipi], 
+        'tenure': [1],             
+        'currentEnergyRating': [2] 
+    })
     
-    try:
-        # İlk deneme
-        location = geolocator.geocode(adres_girisi, timeout=10)
+    tahmin = model.predict(input_data)[0]
+    
+    # --- SONUÇLAR ---
+    col_sonuc, col_grafik = st.columns([1, 2])
+    
+    with col_sonuc:
+        st.subheader("Tahmini Değer")
+        st.metric(label="", value=f"£{tahmin:,.0f}")
+        st.info(f"📍 **Konum:** {adres_metni.split(',')[0]}")
         
-        # Bulunamazsa 'Middlesex' gibi eski terimleri temizleyip tekrar dene
-        if location is None and "Middlesex" in adres_girisi:
-            temiz_adres = adres_girisi.replace("Middlesex", "").strip()
-            location = geolocator.geocode(temiz_adres, timeout=10)
-            
-    except Exception as e:
-        st.error(f"Harita servisine bağlanılamadı: {e}")
+        # Harita
+        map_df = pd.DataFrame({'lat': [lat], 'lon': [lon]})
+        st.map(map_df, zoom=13)
 
-    if location:
-        # --- VERİYİ HAZIRLA ---
-        # Sütun sırası eğitimdekiyle AYNI olmalı
-        input_data = pd.DataFrame({
-            'bedrooms': [oda],
-            'bathrooms': [banyo],
-            'floorAreaSqM': [metrekare],
-            'latitude': [location.latitude],
-            'longitude': [location.longitude],
-            'propertyType': [ev_tipi], 
-            'tenure': [1],             # Varsayılan: Leasehold
-            'currentEnergyRating': [2] # Varsayılan: C Sınıfı
-        })
+    with col_grafik:
+        st.subheader("📊 Fiyat Analizi")
         
-        # --- TAHMİN YAP ---
-        tahmin = model.predict(input_data)[0]
+        explainer = shap.TreeExplainer(model)
+        shap_values = explainer(input_data)
         
-        # --- SONUÇ EKRANI ---
-        col_sonuc, col_grafik = st.columns([1, 2])
+        # Grafik Verileri
+        feature_names = ["Oda", "Banyo", f"Alan ({metrekare:.0f}m²)", "Enlem", "Boylam", "Tip", "Mülkiyet", "Enerji"]
+        values = shap_values[0].values
         
-        with col_sonuc:
-            st.subheader("Tahmini Satış Fiyatı")
-            st.metric(label="", value=f"£{tahmin:,.0f}")
-            
-            st.success(f"📍 Konum Bulundu:\n{location.address.split(',')[0]}, {location.address.split(',')[-2]}")
-            
-            # Harita Gösterimi
-            map_df = pd.DataFrame({'lat': [location.latitude], 'lon': [location.longitude]})
-            st.map(map_df, zoom=13)
+        df_shap = pd.DataFrame({"Özellik": feature_names, "Etki": values})
+        df_shap["Mutlak"] = df_shap["Etki"].abs()
+        df_shap = df_shap.sort_values("Mutlak", ascending=True)
+        
+        fig, ax = plt.subplots(figsize=(8, 5))
+        colors = ['#2ecc71' if x > 0 else '#e74c3c' for x in df_shap["Etki"]]
+        bars = ax.barh(df_shap["Özellik"], df_shap["Etki"], color=colors)
+        ax.axvline(0, color='black', linewidth=0.5)
+        
+        # X ekseni formatı
+        ax.xaxis.set_major_formatter(ticker.FuncFormatter(lambda x, p: f"£{x/1000:.0f}k"))
+        
+        # Etiketleri ekle
+        for bar in bars:
+            width = bar.get_width()
+            label_x_pos = width + (5000 if width > 0 else -5000)
+            ax.text(label_x_pos, bar.get_y() + bar.get_height()/2, f"£{width:,.0f}", va='center')
 
-        with col_grafik:
-            st.subheader("📊 Fiyatın Matematiği")
-            
-            # --- SHAP HESAPLAMA ---
-            explainer = shap.TreeExplainer(model)
-            shap_values = explainer(input_data)
-            
-            # Değerleri Hazırla
-            feature_names = [
-                "Oda Sayısı", "Banyo Sayısı", 
-                f"Alan ({input_data['floorAreaSqM'].values[0]:.0f} m²)",    
-                "Konum", "Boylam", "Ev Tipi", "Mülkiyet", "Enerji"     
-            ]
-            values = shap_values[0].values
-            
-            # --- HESAPLAMA KISMI (MATEMATİKSEL KANIT) ---
-            base_value = shap_values[0].base_values # Ortalama Fiyat
-            total_impact = values.sum()             # Barların Toplamı
-            final_pred = base_value + total_impact  # Sonuç
-            
-            # --- GRAFİK VERİSİ ---
-            df_shap = pd.DataFrame({"Özellik": feature_names, "Etki": values})
-            df_shap["Mutlak"] = df_shap["Etki"].abs()
-            df_shap = df_shap.sort_values("Mutlak", ascending=True)
-            renkler = ['#2ecc71' if x > 0 else '#e74c3c' for x in df_shap["Etki"]]
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        plt.tight_layout()
+        st.pyplot(fig)
 
-            # --- GRAFİK ÇİZİMİ ---
-            fig, ax = plt.subplots(figsize=(10, 6))
-            bars = ax.barh(df_shap["Özellik"], df_shap["Etki"], color=renkler)
-            ax.axvline(0, color='black', linewidth=0.8)
-            
-            # X Ekseni Formatı
-            def currency_formatter(x, pos):
-                return f"£{x/1000:.0f}k"
-            ax.xaxis.set_major_formatter(ticker.FuncFormatter(currency_formatter))
-            
-            # Değerleri Yazdır
-            for bar in bars:
-                width = bar.get_width()
-                align = 'left' if width > 0 else 'right'
-                offset = 5000 if width > 0 else -5000
-                ax.text(width + offset, bar.get_y() + bar.get_height()/2, 
-                        f"£{width:,.0f}", va='center', ha=align, fontsize=10, fontweight='bold')
-
-            ax.spines['top'].set_visible(False)
-            ax.spines['right'].set_visible(False)
-            ax.spines['left'].set_visible(False)
-            plt.tight_layout()
-            st.pyplot(fig)
-
-            # --- HESAP ÖZETİ KUTUSU (YENİ EKLENEN KISIM) ---
-            st.info(f"""
-            **🧮 Fiyat Nasıl Hesaplandı?**
-            
-            Model, hesaplamaya **Piyasa Ortalaması** ile başlar ve özelliklere göre ekleme/çıkarma yapar:
-            
-            | Kalem | Değer |
-            | :--- | :--- |
-            | **Başlangıç (Ortalama Fiyat):** | **£{base_value:,.0f}** |
-            | + Özelliklerin Etkisi (Barlar): | £{total_impact:,.0f} |
-            | **= SONUÇ FİYAT:** | **£{final_pred:,.0f}** |
-            """)
-    else:
-        st.error("❌ Adres bulunamadı! Lütfen sadece 'Posta Kodu' (Örn: HA3 5NE) girmeyi deneyin.")
 else:
-    if not model:
-        st.warning("Lütfen önce modeli eğitip kaydedin.")
-    else:
-        st.info("👈 Tahmin yapmak için sol menüden özellikleri girip butona basın.")
+    st.info("👈 Tahmin için sol menüyü kullanın.")
