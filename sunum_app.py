@@ -14,24 +14,22 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- 2. PERFORMANS İÇİN ÖNBELLEKLEME (CACHE) ---
+# --- 2. MODELİ YÜKLEME (ÖNBELLEKLİ) ---
 @st.cache_resource
 def kaynaklari_yukle():
-    # Modeli Yükle
     model = xgb.XGBRegressor()
     try:
         model.load_model("ev_fiyat_modeli.json")
     except:
         return None, None
     
-    # SHAP Açıklayıcıyı (En ağır işlem) hafızaya al
     explainer = shap.TreeExplainer(model)
     return model, explainer
 
 model, explainer = kaynaklari_yukle()
 
 if not model:
-    st.error("⚠️ Model dosyası (ev_fiyat_modeli.json) bulunamadı!")
+    st.error("⚠️ Model dosyası (ev_fiyat_modeli.json) bulunamadı! Lütfen dosyayı proje klasörüne ekleyin.")
     st.stop()
 
 # --- 3. BAŞLIK ---
@@ -42,17 +40,19 @@ st.markdown("---")
 with st.sidebar:
     st.header("📍 Konum Seçimi")
     
-    # Varsayılan seçim "Listeden Seç" olsun
-    giris_yontemi = st.radio(
+    # Seçenekleri basitleştirdik (Hata riskini azaltmak için)
+    yontem = st.radio(
         "Konum belirleme yöntemi:", 
-        ["Listeden Bölge Seçerek (Önerilen)", "Adres Yazarak", "Manuel Koordinat"]
+        ["Hazır Liste", "Adres Arama", "Manuel Koordinat"]
     )
     
-    lat, lon = 51.5074, -0.1278 
+    # Değişkenleri başlat
+    lat = 51.5074
+    lon = -0.1278 
     adres_metni = "Bilinmiyor"
-
-    # --- SEÇENEK 1: LİSTE (HIZLI VE GÜVENLİ) ---
-    if giris_yontemi == "Listeden Bölge Seçerek (Önerilen)":
+    
+    # --- DURUM 1: HAZIR LİSTE (KOORDİNAT KUTUSU GİZLENİR) ---
+    if yontem == "Hazır Liste":
         bolge_verisi = {
             "Harrow (Banliyö)": {"lat": 51.5898, "lon": -0.3346, "desc": "Harrow, Greater London"},
             "Wembley (Stadyum)": {"lat": 51.5505, "lon": -0.3048, "desc": "Wembley Park"},
@@ -71,21 +71,26 @@ with st.sidebar:
         }
 
         secilen_bolge = st.selectbox("🗺️ Bir Bölge Seçin:", list(bolge_verisi.keys()))
+        
+        # Seçilen verileri çek
         secim = bolge_verisi[secilen_bolge]
-        lat, lon, adres_metni = secim["lat"], secim["lon"], secim["desc"]
-        st.success(f"✅ Seçildi: {adres_metni}")
+        lat = secim["lat"]
+        lon = secim["lon"]
+        adres_metni = secim["desc"]
+        
+        st.success(f"✅ Konum Ayarlandı: {adres_metni}")
 
-    # --- SEÇENEK 2: ADRES ---
-    elif giris_yontemi == "Adres Yazarak":
+    # --- DURUM 2: ADRES ARAMA ---
+    elif yontem == "Adres Arama":
         adres_girisi = st.text_input("🏠 Adres / Posta Kodu", value="HA3 5NE")
-        st.warning("⚠️ Not: Harita servisi yavaş olabilir.")
+        st.info("Not: Hesapla butonuna basınca aranır.")
 
-    # --- SEÇENEK 3: MANUEL ---
-    else:
-        st.info("Google Maps koordinatlarını girin.")
-        lat = st.number_input("Enlem", value=51.5074, format="%.4f")
-        lon = st.number_input("Boylam", value=-0.1278, format="%.4f")
-        adres_metni = f"Özel Konum ({lat}, {lon})"
+    # --- DURUM 3: MANUEL (SADECE BU SEÇİLİRSE KUTULAR ÇIKAR) ---
+    elif yontem == "Manuel Koordinat":
+        st.warning("Google Maps koordinatlarını giriniz.")
+        lat = st.number_input("Enlem (Latitude)", value=51.5074, format="%.4f")
+        lon = st.number_input("Boylam (Longitude)", value=-0.1278, format="%.4f")
+        adres_metni = f"Manuel Konum ({lat}, {lon})"
 
     st.markdown("---")
     st.header("Ev Özellikleri")
@@ -110,7 +115,7 @@ with st.sidebar:
 if hesapla_btn:
     
     # Adres seçiliyse API çağrısı (Sadece butona basınca)
-    if giris_yontemi == "Adres Yazarak":
+    if yontem == "Adres Arama":
         ua = f"emlak_demo_{random.randint(1000, 9999)}"
         geolocator = Nominatim(user_agent=ua)
         try:
@@ -123,12 +128,12 @@ if hesapla_btn:
                     lat, lon, adres_metni = 51.6013, -0.3504, "Carmelite Road (Yedek)"
                     st.warning("⚠️ Yedek koordinatlar kullanıldı.")
                 else:
-                    st.error("Adres bulunamadı.")
+                    st.error("Adres bulunamadı. Lütfen 'Hazır Liste'yi kullanın.")
                     st.stop()
         except:
-             # Hata durumunda Harrow'u varsayılan al (Sunum kurtarıcı)
+            # Hata durumunda Harrow'u varsayılan al
             lat, lon, adres_metni = 51.5898, -0.3346, "Harrow (Yedek Konum)"
-            st.error("Harita servisi meşgul, varsayılan konum kullanıldı.")
+            st.error("Harita servisi meşgul, varsayılan konum (Harrow) kullanıldı.")
 
     # Tahmin Verisi
     input_data = pd.DataFrame({
@@ -152,7 +157,6 @@ if hesapla_btn:
 
     with col_grafik:
         st.subheader("📊 Fiyat Analizi")
-        # Grafik verisi
         feature_names = ["Oda", "Banyo", f"Alan ({metrekare:.0f}m²)", "Enlem", "Boylam", "Tip", "Mülkiyet", "Enerji"]
         values = shap_values[0].values
         df_shap = pd.DataFrame({"Özellik": feature_names, "Etki": values}).sort_values("Etki", key=abs)
